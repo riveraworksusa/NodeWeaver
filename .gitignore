@@ -1,0 +1,26 @@
+# Output folders — never commit processed or output files
+READY/
+PROCESSED/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+env/
+
+# Environment / secrets — never commit your API key
+.env
+*.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Processed originals
+*.processed
