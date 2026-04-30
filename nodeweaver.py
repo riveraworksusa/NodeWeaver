@@ -5,24 +5,24 @@ Drop any .md file into this folder. NodeWeaver transforms it
 into a connected network of nodes optimized for Obsidian graph view.
 """
 
-import os
-import sys
 import json
-import time
+import itertools
 import logging
 import threading
+import time
 from pathlib import Path
 
-import anthropic
+import ollama
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WATCH_DIR     = Path(__file__).parent          # drop zone — watched for incoming .md files
-PROCESSED_DIR = WATCH_DIR / "PROCESSED"       # originals move here after processing
-READY_DIR     = WATCH_DIR / "READY"           # output nodes land here (not watched → no loop)
-MODEL         = "claude-sonnet-4-6"
-MAX_TOKENS    = 16000
+WATCH_DIR     = Path(__file__).parent
+PROCESSED_DIR = WATCH_DIR / "PROCESSED"
+READY_DIR     = WATCH_DIR / "READY"
+MODEL         = "llama3.1"
+CHUNK_CHARS   = 12000   # safe context size for llama3.1 on CPU
+CHUNK_TIMEOUT = 600     # seconds before a hung chunk is abandoned
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("NodeWeaver")
 
-# ── System prompt (cached) ────────────────────────────────────────────────────
+# ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 You are NodeWeaver — an AI that transforms raw Markdown files into optimized,
 interconnected Obsidian knowledge-graph nodes.
@@ -94,18 +94,129 @@ type: hub | note | law | chapter | concept | reference | tool
 """
 
 
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+
+def repair_json(text: str) -> str:
+    """Escape literal control characters inside JSON string values."""
+    result = []
+    in_string = False
+    escape_next = False
+    for char in text:
+        if escape_next:
+            result.append(char)
+            escape_next = False
+        elif char == "\\":
+            result.append(char)
+            escape_next = True
+        elif char == '"':
+            in_string = not in_string
+            result.append(char)
+        elif in_string and char == "\n":
+            result.append("\\n")
+        elif in_string and char == "\r":
+            result.append("\\r")
+        elif in_string and char == "\t":
+            result.append("\\t")
+        else:
+            result.append(char)
+    return "".join(result)
+
+
 def extract_json(raw: str) -> dict:
-    """Pull JSON from Claude's response, handling markdown code fences."""
+    """Parse JSON from model response, handling code fences and unescaped control chars."""
     text = raw.strip()
     if "```json" in text:
         text = text.split("```json", 1)[1].split("```", 1)[0].strip()
     elif "```" in text:
         text = text.split("```", 1)[1].split("```", 1)[0].strip()
-    return json.loads(text)
+    return json.loads(repair_json(text))
 
 
-def process_file(filepath: Path, client: anthropic.Anthropic) -> None:
-    """Send a .md file through Claude and write the optimized output."""
+# ── Text chunking ─────────────────────────────────────────────────────────────
+
+def chunk_text(text: str, size: int) -> list[str]:
+    """Split text on paragraph boundaries near each size limit."""
+    chunks, current, count = [], [], 0
+    for para in text.split("\n\n"):
+        if count + len(para) > size and current:
+            chunks.append("\n\n".join(current))
+            current, count = [], 0
+        current.append(para)
+        count += len(para)
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks
+
+
+# ── Ollama call with progress display ────────────────────────────────────────
+
+def call_ollama(prompt: str, chunk_num: int, total_chunks: int, chunk_times: list) -> str:
+    result: dict = {}
+    error:  dict = {}
+
+    def _run() -> None:
+        try:
+            result["response"] = ollama.chat(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": prompt},
+                ],
+                options={"num_ctx": 8192},
+            )
+        except Exception as exc:
+            error["exc"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    spinner   = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    start     = time.time()
+    bar_width = 20
+
+    while thread.is_alive():
+        elapsed      = time.time() - start
+        filled       = int(bar_width * (chunk_num - 1) / total_chunks)
+        bar          = "█" * filled + "░" * (bar_width - filled)
+        pct          = int(100 * (chunk_num - 1) / total_chunks)
+        e_min, e_sec = divmod(int(elapsed), 60)
+
+        if chunk_times:
+            avg       = sum(chunk_times) / len(chunk_times)
+            remaining = max(0, avg * (total_chunks - chunk_num + 1) - elapsed)
+            r_min, r_sec = divmod(int(remaining), 60)
+            eta = f"~{r_min:02d}:{r_sec:02d} remaining"
+        else:
+            eta = "estimating…"
+
+        print(
+            f"\r  Chunk {chunk_num}/{total_chunks} [{bar}] {pct:3d}%"
+            f"  {next(spinner)} {e_min:02d}:{e_sec:02d} elapsed  {eta}   ",
+            end="", flush=True,
+        )
+        time.sleep(0.1)
+
+        if elapsed > CHUNK_TIMEOUT:
+            raise TimeoutError(f"Chunk {chunk_num} exceeded {CHUNK_TIMEOUT}s timeout.")
+
+    elapsed = time.time() - start
+    chunk_times.append(elapsed)
+    filled  = int(bar_width * chunk_num / total_chunks)
+    bar     = "█" * filled + "░" * (bar_width - filled)
+    pct     = int(100 * chunk_num / total_chunks)
+    print(
+        f"\r  Chunk {chunk_num}/{total_chunks} [{bar}] {pct:3d}%"
+        f"  ✓ {int(elapsed)}s{' ' * 30}"
+    )
+
+    if "exc" in error:
+        raise error["exc"]
+    return result["response"].message.content
+
+
+# ── File processor ────────────────────────────────────────────────────────────
+
+def process_file(filepath: Path) -> None:
     log.info(f"┌ Processing: {filepath.name}")
 
     try:
@@ -118,92 +229,63 @@ def process_file(filepath: Path, client: anthropic.Anthropic) -> None:
         log.warning("  Empty file — skipping.")
         return
 
-    log.info(f"│ Sending {len(content):,} chars to Claude…")
+    chunks = chunk_text(content, CHUNK_CHARS)
+    log.info(f"│ {len(content):,} chars → {len(chunks)} chunk(s) → {MODEL}")
 
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},   # cache the system prompt
-                }
-            ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Transform this file into optimized Obsidian nodes.\n\n"
-                        f"Original filename: {filepath.name}\n\n"
-                        f"---\n\n{content}"
-                    ),
-                }
-            ],
+    all_files:   list = []
+    chunk_times: list = []
+
+    for i, chunk in enumerate(chunks, 1):
+        log.info(f"│ Chunk {i}/{len(chunks)} ({len(chunk):,} chars)…")
+        prompt = (
+            f"Transform this file into optimized Obsidian nodes.\n\n"
+            f"Original filename: {filepath.stem} Part {i}.md\n\n"
+            f"---\n\n{chunk}"
         )
-    except anthropic.APIError as exc:
-        log.error(f"  API error: {exc}")
-        return
+        try:
+            raw = call_ollama(prompt, i, len(chunks), chunk_times)
+        except Exception as exc:
+            log.error(f"  Error on chunk {i}: {exc}")
+            return
 
-    # Extract text (skip any thinking blocks)
-    raw = ""
-    for block in response.content:
-        if block.type == "text":
-            raw = block.text
-            break
+        try:
+            result   = extract_json(raw)
+            strategy = result.get("strategy", "?")
+            reason   = result.get("reason", "")
+            all_files.extend(result["files"])
+            log.info(f"│ Chunk {i} → {strategy}: {reason}")
+        except (json.JSONDecodeError, KeyError) as exc:
+            log.error(f"  Could not parse chunk {i}: {exc}")
+            log.error(f"  Raw (first 500):\n{raw[:500]}")
+            return
 
-    try:
-        result = extract_json(raw)
-        files  = result["files"]
-        strategy = result.get("strategy", "?")
-        reason   = result.get("reason", "")
-    except (json.JSONDecodeError, KeyError) as exc:
-        log.error(f"  Could not parse response: {exc}")
-        log.debug(f"  Raw response (first 500): {raw[:500]}")
-        return
-
-    log.info(f"│ Strategy: {strategy} — {reason}")
-
-    # Write output files into READY/ (not watched — prevents infinite loop)
     READY_DIR.mkdir(exist_ok=True)
     written = []
-    for fd in files:
+    for fd in all_files:
         out_path = READY_DIR / fd["filename"]
         out_path.write_text(fd["content"], encoding="utf-8")
         written.append(fd["filename"])
         log.info(f"│   ✓ {fd['filename']}")
 
-    # Move original into PROCESSED/ — handle name collision with a timestamp suffix
     PROCESSED_DIR.mkdir(exist_ok=True)
     done_path = PROCESSED_DIR / filepath.name
     if done_path.exists():
-        stamp = time.strftime("%H%M%S")
+        stamp     = int(time.time() * 1000)
         done_path = PROCESSED_DIR / f"{filepath.stem}_{stamp}{filepath.suffix}"
     filepath.rename(done_path)
 
-    # Log cache savings
-    usage = response.usage
-    cached = getattr(usage, "cache_read_input_tokens", 0) or 0
-    if cached:
-        log.info(f"│ Cache hit: {cached:,} tokens saved")
-
-    log.info(f"└ Done → {len(written)} file(s) in READY/. Original moved to PROCESSED/")
-    log.info(f"  Pick up your files from NODEWEAVER/READY/ and move them home.")
+    log.info(f"└ Done → {len(written)} file(s) written to {READY_DIR}")
 
 
 # ── File watcher ──────────────────────────────────────────────────────────────
 
 class DropHandler(FileSystemEventHandler):
-    def __init__(self, client: anthropic.Anthropic):
-        self._client = client
+    def __init__(self) -> None:
         self._seen: set[str] = set()
-        self._lock  = threading.Lock()          # Bug 2 fix: protect shared set
+        self._lock = threading.Lock()
 
-    def _trigger(self, path: Path):
-        if path.suffix.lower() != ".md":
-            return
-        if path.name.startswith("."):
+    def _trigger(self, path: Path) -> None:
+        if path.suffix.lower() != ".md" or path.name.startswith("."):
             return
         key = str(path)
         with self._lock:
@@ -211,56 +293,48 @@ class DropHandler(FileSystemEventHandler):
                 return
             self._seen.add(key)
 
-        # Bug 3 fix: run in a thread so the watcher is never blocked
-        def run():
+        def run() -> None:
             try:
-                time.sleep(0.8)      # wait for file to finish writing
+                time.sleep(0.8)
                 if path.exists():
-                    process_file(path, self._client)
+                    process_file(path)
             finally:
                 with self._lock:
                     self._seen.discard(key)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def on_created(self, event):
+    def on_created(self, event) -> None:
         if not event.is_directory:
             self._trigger(Path(event.src_path))
 
-    def on_moved(self, event):
+    def on_moved(self, event) -> None:
         if not event.is_directory:
             self._trigger(Path(event.dest_path))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        sys.exit("ERROR: ANTHROPIC_API_KEY environment variable is not set.")
-
-    client = anthropic.Anthropic(api_key=api_key)
-
+def main() -> None:
     PROCESSED_DIR.mkdir(exist_ok=True)
     READY_DIR.mkdir(exist_ok=True)
 
     log.info("━" * 52)
     log.info("  NodeWeaver — Obsidian Graph Optimizer")
-    log.info(f"  Model    : {MODEL}")
+    log.info(f"  Model    : {MODEL} (Ollama)")
     log.info(f"  Drop zone: {WATCH_DIR}")
     log.info(f"  Output   : {READY_DIR}")
     log.info("  Drop .md files here. Press Ctrl+C to stop.")
     log.info("━" * 52)
 
-    # Process any .md files already in the drop zone (skip README and output files)
-    skip = {"README.md"}
+    skip     = {"README.md"}
     existing = [f for f in WATCH_DIR.glob("*.md") if f.name not in skip]
     if existing:
         log.info(f"Found {len(existing)} existing file(s) — processing now…")
         for f in existing:
-            process_file(f, client)
+            process_file(f)
 
-    handler  = DropHandler(client)
+    handler  = DropHandler()
     observer = Observer()
     observer.schedule(handler, str(WATCH_DIR), recursive=False)
     observer.start()
