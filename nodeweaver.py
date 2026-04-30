@@ -22,7 +22,7 @@ PROCESSED_DIR = WATCH_DIR / "PROCESSED"
 READY_DIR     = WATCH_DIR / "READY"
 MODEL         = "llama3.1"
 CHUNK_CHARS   = 12000   # safe context size for llama3.1 on CPU
-CHUNK_TIMEOUT = 600     # seconds before a hung chunk is abandoned
+CHUNK_TIMEOUT = 1200    # seconds before a hung chunk is abandoned
 
 logging.basicConfig(
     level=logging.INFO,
@@ -135,14 +135,29 @@ def extract_json(raw: str) -> dict:
 # ── Text chunking ─────────────────────────────────────────────────────────────
 
 def chunk_text(text: str, size: int) -> list[str]:
-    """Split text on paragraph boundaries near each size limit."""
+    """Split text on paragraph boundaries near each size limit.
+    Falls back to line-level splitting for paragraphs that exceed size."""
     chunks, current, count = [], [], 0
     for para in text.split("\n\n"):
-        if count + len(para) > size and current:
-            chunks.append("\n\n".join(current))
-            current, count = [], 0
-        current.append(para)
-        count += len(para)
+        if len(para) > size:
+            if current:
+                chunks.append("\n\n".join(current))
+                current, count = [], 0
+            for line in para.split("\n"):
+                if count + len(line) > size and current:
+                    chunks.append("\n".join(current))
+                    current, count = [], 0
+                current.append(line)
+                count += len(line)
+            if current:
+                chunks.append("\n".join(current))
+                current, count = [], 0
+        else:
+            if count + len(para) > size and current:
+                chunks.append("\n\n".join(current))
+                current, count = [], 0
+            current.append(para)
+            count += len(para)
     if current:
         chunks.append("\n\n".join(current))
     return chunks
@@ -206,7 +221,8 @@ def call_ollama(prompt: str, chunk_num: int, total_chunks: int, chunk_times: lis
     pct     = int(100 * chunk_num / total_chunks)
     print(
         f"\r  Chunk {chunk_num}/{total_chunks} [{bar}] {pct:3d}%"
-        f"  ✓ {int(elapsed)}s{' ' * 30}"
+        f"  ✓ {int(elapsed)}s{' ' * 30}\n",
+        end="", flush=True,
     )
 
     if "exc" in error:
@@ -259,22 +275,18 @@ def process_file(filepath: Path) -> None:
             log.error(f"  Raw (first 500):\n{raw[:500]}")
             return
 
-    READY_DIR.mkdir(exist_ok=True)
-    written = []
     for fd in all_files:
         out_path = READY_DIR / fd["filename"]
         out_path.write_text(fd["content"], encoding="utf-8")
-        written.append(fd["filename"])
         log.info(f"│   ✓ {fd['filename']}")
 
-    PROCESSED_DIR.mkdir(exist_ok=True)
     done_path = PROCESSED_DIR / filepath.name
     if done_path.exists():
         stamp     = int(time.time() * 1000)
         done_path = PROCESSED_DIR / f"{filepath.stem}_{stamp}{filepath.suffix}"
     filepath.rename(done_path)
 
-    log.info(f"└ Done → {len(written)} file(s) written to {READY_DIR}")
+    log.info(f"└ Done → {len(all_files)} file(s) written to {READY_DIR}")
 
 
 def ask_continue() -> bool:
@@ -290,7 +302,7 @@ def ask_continue() -> bool:
 
 class DropHandler(FileSystemEventHandler):
     def __init__(self, stop_event: threading.Event) -> None:
-        self._seen:       set[str]        = set()
+        self._seen       : set[str] = set()
         self._lock        = threading.Lock()
         self._stop_event  = stop_event
 
