@@ -277,12 +277,22 @@ def process_file(filepath: Path) -> None:
     log.info(f"└ Done → {len(written)} file(s) written to {READY_DIR}")
 
 
+def ask_continue() -> bool:
+    """Ask the user if they want to process another file."""
+    try:
+        answer = input("\n  Process another file? (y/n): ").strip().lower()
+        return answer in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
 # ── File watcher ──────────────────────────────────────────────────────────────
 
 class DropHandler(FileSystemEventHandler):
-    def __init__(self) -> None:
-        self._seen: set[str] = set()
-        self._lock = threading.Lock()
+    def __init__(self, stop_event: threading.Event) -> None:
+        self._seen:       set[str]        = set()
+        self._lock        = threading.Lock()
+        self._stop_event  = stop_event
 
     def _trigger(self, path: Path) -> None:
         if path.suffix.lower() != ".md" or path.name.startswith("."):
@@ -298,6 +308,8 @@ class DropHandler(FileSystemEventHandler):
                 time.sleep(0.8)
                 if path.exists():
                     process_file(path)
+                if not ask_continue():
+                    self._stop_event.set()
             finally:
                 with self._lock:
                     self._seen.discard(key)
@@ -327,20 +339,27 @@ def main() -> None:
     log.info("  Drop .md files here. Press Ctrl+C to stop.")
     log.info("━" * 52)
 
+    stop_event = threading.Event()
+
     skip     = {"README.md"}
     existing = [f for f in WATCH_DIR.glob("*.md") if f.name not in skip]
     if existing:
         log.info(f"Found {len(existing)} existing file(s) — processing now…")
         for f in existing:
             process_file(f)
+        if not ask_continue():
+            log.info("NodeWeaver stopped.")
+            return
 
-    handler  = DropHandler()
+    handler  = DropHandler(stop_event)
     observer = Observer()
     observer.schedule(handler, str(WATCH_DIR), recursive=False)
     observer.start()
 
+    log.info("Watching for new files. Drop a .md file in or press Ctrl+C to stop.")
+
     try:
-        while True:
+        while not stop_event.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         pass
